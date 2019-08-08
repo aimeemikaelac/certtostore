@@ -66,6 +66,8 @@ const (
 	rsa1Magic = 0x31415352 // "RSA1"
 	// https://github.com/dotnet/corefx/blob/master/src/Common/src/Interop/Windows/BCrypt/Interop.Blobs.cs#L92
   ecdsaP256Magic = 0x31534345
+	ecdsaP384Magic = 0x33534345
+	ecdsaP521Magic = 0x35534345
 
 	// ncrypt.h constants
 	ncryptPersistFlag      = 0x80000000 // NCRYPT_PERSIST_FLAG
@@ -123,6 +125,7 @@ var (
 	nCryptGetProperty               = nCrypt.MustFindProc("NCryptGetProperty")
 	nCryptSetProperty               = nCrypt.MustFindProc("NCryptSetProperty")
 	nCryptSignHash                  = nCrypt.MustFindProc("NCryptSignHash")
+	nCryptDeleteKey									= nCrypt.MustFindProc("NCryptDeleteKey")
 )
 
 // paddingInfo is the BCRYPT_PKCS1_PADDING_INFO struct in bcrypt.h.
@@ -445,6 +448,8 @@ type Key interface {
 	// Decrypt(rand io.Reader, blob []byte, opts crypto.DecrypterOpts) ([]byte, error)
 	Public() crypto.PublicKey
 	// SetACL(store *WinCertStore, access string, sid string, perm string) error
+	SignRaw(data []byte) ([]byte, error)
+	Delete() error
 }
 
 // EcdsaKey and RsaKey implement crypto.Signer and crypto.Decrypter for key based operations.
@@ -477,32 +482,24 @@ func (k *RsaKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]
 		return nil, fmt.Errorf("unsupported hash algorithm %v", hf)
 	}
 
-	return rsaSign(k.handle, digest, algID)
+	return signHashPkcs1Padding(k.handle, digest, algID)
 }
 
-func (k *EcdsaKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-  hf := opts.HashFunc()
-  algID, ok := algIDs[hf]
-  if !ok {
-		return nil, fmt.Errorf("unsupported hash algorithm %v", hf)
-	}
-
-	return ecdsaSign(k.handle, digest, algID)
+func (k *EcdsaKey) Sign(rand io.Reader, digest []byte, _ crypto.SignerOpts) ([]byte, error) {
+	return signHashNoPadding(k.handle, digest)
 }
 
-func ecdsaSign(kh uintptr, digest []byte, algID *uint16) ([]byte, error) {
-	// padInfo := paddingInfo{pszAlgID: algID}
+func (k *RsaKey) SignRaw(digest []byte) ([]byte, error) {
+	return signHashNoPadding(k.handle, digest)
+}
+
+func (k *EcdsaKey) SignRaw(digest []byte) ([]byte, error) {
+	return signHashNoPadding(k.handle, digest)
+}
+
+func signHashNoPadding(kh uintptr, digest []byte) ([]byte, error) {
 	var size uint32
 	// Obtain the size of the signature
-	// r, _, err := nCryptSignHash.Call(
-	// 	kh,
-	// 	uintptr(unsafe.Pointer(&padInfo)),
-	// 	uintptr(unsafe.Pointer(&digest[0])),
-	// 	uintptr(len(digest)),
-	// 	0,
-	// 	0,
-	// 	uintptr(unsafe.Pointer(&size)),
-	// 	bCryptPadPKCS1)
   r, _, err := nCryptSignHash.Call(
 		kh,
 		uintptr(0),
@@ -534,7 +531,7 @@ func ecdsaSign(kh uintptr, digest []byte, algID *uint16) ([]byte, error) {
 	return sig[:size], nil
 }
 
-func rsaSign(kh uintptr, digest []byte, algID *uint16) ([]byte, error) {
+func signHashPkcs1Padding(kh uintptr, digest []byte, algID *uint16) ([]byte, error) {
 	padInfo := paddingInfo{pszAlgID: algID}
 	var size uint32
 	// Obtain the size of the signature
@@ -693,7 +690,7 @@ func (w *WinCertStore) Key() (Key, error) {
 		uintptr(unsafe.Pointer(&kh)),
 		uintptr(unsafe.Pointer(wide(w.container))),
 		0,
-		nCryptMachineKey)
+		0)
 	if r != 0 {
 		return nil, fmt.Errorf("NCryptOpenKey for container %s returned %X: %v", w.container, r, err)
 	}
@@ -723,46 +720,89 @@ func (w *WinCertStore) Key() (Key, error) {
 	}
 }
 
+func (k *EcdsaKey) Delete() error {
+	r, _, err := nCryptDeleteKey.Call(
+		k.handle,
+		0,
+	)
+	if r != 0 {
+		return fmt.Errorf("NCryptDeleteKey returned %X: %v", r, err)
+	}
+	return nil
+}
+
+func (k *RsaKey) Delete() error {
+	r, _, err := nCryptDeleteKey.Call(
+		k.handle,
+		0,
+	)
+	if r != 0 {
+		return fmt.Errorf("NCryptDeleteKey returned %X: %v", r, err)
+	}
+	return nil
+}
+
 // Generate returns a crypto.Signer representing either a TPM-backed or
 // software backed key, depending on support from the host OS
 // key size is set to the maximum supported by Microsoft Software Key Storage Provider
-func (w *WinCertStore) Generate(keySize int) (crypto.Signer, error) {
+func (w *WinCertStore) Generate(keySize int, alg string) (crypto.Signer, error) {
 	logger.Infof("Provider: %s", w.ProvName)
-	// The MPCP only supports a max keywidth of 2048, due to the TPM specification.
-	// https://www.microsoft.com/en-us/download/details.aspx?id=52487
-	// The Microsoft Software Key Storage Provider supports a max keywidth of 16384.
-	if keySize > 16384 {
-		return nil, fmt.Errorf("unsupported keysize, got: %d, want: < %d", keySize, 16384)
+	var algId string
+	switch alg {
+	case "RSA":
+		algId = "RSA"
+		// The MPCP only supports a max keywidth of 2048, due to the TPM specification.
+		// https://www.microsoft.com/en-us/download/details.aspx?id=52487
+		// The Microsoft Software Key Storage Provider supports a max keywidth of 16384.
+		if keySize > 16384 {
+			return nil, fmt.Errorf("unsupported keysize, got: %d, want: < %d", keySize, 16384)
+		}
+	case "ECDSA_P256":
+		algId = "ECDSA_P256"
+		keySize = 256
+	case "ECDSA_P384":
+		algId = "ECDSA_P384"
+		keySize = 384
+	case "ECDSA_P521":
+		algId = "ECDSA_P521"
+		keySize = 521
+	default:
+		return nil, fmt.Errorf("unsupported algorithm: %s", alg)
 	}
 
+
 	var kh uintptr
-	var length = uint32(keySize)
 	// Pass 0 as the fifth parameter because it is not used (legacy)
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/aa376247(v=vs.85).aspx
 	r, _, err := nCryptCreatePersistedKey.Call(
 		uintptr(w.Prov),
 		uintptr(unsafe.Pointer(&kh)),
-		uintptr(unsafe.Pointer(wide("RSA"))),
+		uintptr(unsafe.Pointer(wide(algId))),
 		uintptr(unsafe.Pointer(wide(w.container))),
 		0,
-		nCryptMachineKey|nCryptOverwriteKey)
+		nCryptOverwriteKey)
 	if r != 0 {
 		return nil, fmt.Errorf("NCryptCreatePersistedKey returned %X: %v", r, err)
 	}
 
-	// Microsoft function calls return actionable return codes in r, err is often filled with text, even when successful
-	r, _, err = nCryptSetProperty.Call(
-		kh,
-		uintptr(unsafe.Pointer(wide("Length"))),
-		uintptr(unsafe.Pointer(&length)),
-		unsafe.Sizeof(length),
-		ncryptPersistFlag)
-	if r != 0 {
-		return nil, fmt.Errorf("NCryptSetProperty (Length) returned %X: %v", r, err)
+	var usage uint32
+	if algId == "RSA" {
+		var length = uint32(keySize)
+		// Microsoft function calls return actionable return codes in r, err is often filled with text, even when successful
+		r, _, err = nCryptSetProperty.Call(
+			kh,
+			uintptr(unsafe.Pointer(wide("Length"))),
+			uintptr(unsafe.Pointer(&length)),
+			unsafe.Sizeof(length),
+			ncryptPersistFlag)
+		if r != 0 {
+			return nil, fmt.Errorf("NCryptSetProperty (Length) returned %X: %v", r, err)
+		}
+		usage = ncryptAllowDecryptFlag | ncryptAllowSigningFlag
+	} else {
+		usage = ncryptAllowSigningFlag
 	}
 
-	var usage uint32
-	usage = ncryptAllowDecryptFlag | ncryptAllowSigningFlag
 	r, _, err = nCryptSetProperty.Call(
 		kh,
 		uintptr(unsafe.Pointer(wide("Key Usage"))),
@@ -795,7 +835,12 @@ func (w *WinCertStore) Generate(keySize int) (crypto.Signer, error) {
 
 		return &RsaKey{handle: kh, pub: pub, Container: uc}, nil
 	case "ECDSA":
-		return nil, fmt.Errorf("Unsupported key algorithm: %s", keyAlgType)
+		uc, pub, err := ecdsaKeyMetadata(kh, w)
+		if err != nil {
+			return nil, err
+		}
+
+		return &EcdsaKey{handle: kh, pub: pub, Container: uc}, nil
 	default:
 		return nil, fmt.Errorf("Unsupported key algorithm: %s", keyAlgType)
 	}
@@ -915,8 +960,16 @@ func unmarshalEcdsa(buf []byte, kh uintptr) (*ecdsa.PublicKey, error) {
 		return nil, err
 	}
 
-	if header.Magic != ecdsaP256Magic {
-		return nil, fmt.Errorf("invalid header magic %x", header.Magic)
+	var curve elliptic.Curve
+	switch header.Magic {
+	case ecdsaP256Magic:
+		curve = elliptic.P256()
+	case ecdsaP384Magic:
+		curve = elliptic.P384()
+	case ecdsaP521Magic:
+		curve = elliptic.P521()
+	default:
+		return nil, fmt.Errorf("Unsupported ECDSA header magic %x", header.Magic)
 	}
 
 	x := make([]byte, header.CBKey)
@@ -938,58 +991,12 @@ func unmarshalEcdsa(buf []byte, kh uintptr) (*ecdsa.PublicKey, error) {
     return nil, fmt.Errorf("Failed to read in %d bytes for the curve point y. Actually read %d bytes", int(header.CBKey), n)
   }
 
-	curve, err := getEcdsaCurve(kh)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to determine elliptic curve for ECDSA key: %v", err)
-	}
-
 	pub := &ecdsa.PublicKey{
     Curve: curve,
     X: new(big.Int).SetBytes(x),
     Y: new(big.Int).SetBytes(y),
 	}
 	return pub, nil
-}
-
-func getEcdsaCurve(kh uintptr) (elliptic.Curve, error) {
-	var length uint32
-	// See https://docs.microsoft.com/en-us/windows/win32/seccng/cng-algorithm-identifiers for algorithm identifiers
-	r, _, err := nCryptGetProperty.Call(
-		kh,
-		uintptr(unsafe.Pointer(wide("Length"))),
-		0,
-		0,
-		uintptr(unsafe.Pointer(&length)),
-		0,
-		0)
-	if r != 0 {
-		return nil, fmt.Errorf("NCryptGetProperty returned %X during size check, %v", r, err)
-	}
-
-	buf := make([]byte, length)
-	r, _, err = nCryptGetProperty.Call(
-		kh,
-		uintptr(unsafe.Pointer(wide("Length"))),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(length),
-		uintptr(unsafe.Pointer(&length)),
-		0,
-		0)
-	if r != 0 {
-		return nil, fmt.Errorf("NCryptGetProperty returned %X during export, %v", r, err)
-	}
-
-	bits := binary.LittleEndian.Uint32(buf)
-	switch bits {
-	case 256:
-		return elliptic.P256(), nil
-	case 384:
-		return elliptic.P384(), nil
-	case 521:
-		return elliptic.P521(), nil
-	default:
-		return nil, fmt.Errorf("Unsupported ECDSA curve: %v", bits)
-	}
 }
 
 // container returns the unique container name of a private key
